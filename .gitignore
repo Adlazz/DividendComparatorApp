@@ -1,2 +1,2 @@
 # Ignorar entornos virtuales
-env/
+venv/

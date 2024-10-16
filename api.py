@@ -1,63 +1,125 @@
-# api.py
-from fastapi import FastAPI, HTTPException
-import yfinance as yf
-from datetime import datetime, timedelta
+import streamlit as st
 import pandas as pd
+import plotly.express as px
+import requests
 
-app = FastAPI()
+# Page configuration
+st.set_page_config(page_title="DividendComparatorApp", page_icon="📈", layout="wide")
 
-COMPANY_INFO = {
-    'T': 'AT&T Inc.',
-    'O': 'Realty Income Corporation',
-    'PG': 'Procter & Gamble Company',
-    'JNJ': 'Johnson & Johnson',
-    'XOM': 'Exxon Mobil Corporation',
-    'KO': 'The Coca-Cola Company',
-    'AAPL': 'Apple Inc.',
-    'MSFT': 'Microsoft Corporation',
-    'INTC': 'Intel Corporation',
-    'IBM': 'International Business Machines Corporation',
-    'CSCO': 'Cisco Systems, Inc.',
-    'TXN': 'Texas Instruments Incorporated'
+# Application title
+st.title("🌟 DividendComparatorApp")
+
+# API endpoint
+API_ENDPOINT = "http://localhost:8501"  # Update this if your FastAPI server is on a different address
+
+# Fetch company list from API
+@st.cache_data
+def get_company_list():
+    response = requests.get(f"{API_ENDPOINT}/company_list")
+    return response.json()
+
+COMPANY_INFO = get_company_list()
+
+# Color mapping for sectors
+SECTOR_COLORS = {
+    'Technology': '#1f77b4',
+    'Consumer Goods': '#ff7f0e',
+    'Energy': '#2ca02c',
+    'Telecommunications': '#d62728',
+    'Finance': '#9467bd',
+    'Health': '#8c564b',
+    'Utilities': '#e377c2',
+    'Real Estate': '#7f7f7f',
+    'Industrials': '#bcbd22',
+    'Food and Beverages': '#17becf'
 }
 
-def get_dividend_data(symbol, months):
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=months * 30)
-    
-    stock = yf.Ticker(symbol)
-    hist = stock.history(start=start_date, end=end_date)
-    dividends = hist['Dividends']
-    
-    current_price = stock.info['currentPrice']
-    shares = 1000 / current_price  # Asumiendo una inversión inicial de $1000
-    
-    monthly_dividends = dividends.resample('M').sum()
-    cumulative_dividends = (monthly_dividends * shares).cumsum()
-    
-    return cumulative_dividends, COMPANY_INFO.get(symbol, 'Unknown Company')
+# User interface
+st.sidebar.header("📊 Configuration")
 
-@app.get("/dividend_comparison/{months}")
-async def get_dividend_comparison(months: int, symbols: str):
-    symbol_list = symbols.split(',')
-    if len(symbol_list) > 6:
-        raise HTTPException(status_code=400, detail="Maximum 6 companies allowed")
-    
-    data = {}
-    company_names = {}
-    for symbol in symbol_list:
-        try:
-            dividend_data, company_name = get_dividend_data(symbol, months)
-            data[symbol] = dividend_data
-            company_names[symbol] = company_name
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Error fetching data for {symbol}: {str(e)}")
-    
-    df = pd.DataFrame(data)
-    df.index = df.index.strftime('%Y-%m-%d')
-    
-    return {"data": df.to_dict(orient='index'), "company_names": company_names}
+# Sector filter
+sectors = list(set(company['sector'] for company in COMPANY_INFO.values()))
+selected_sectors = st.sidebar.multiselect(
+    "Select sectors:",
+    options=sectors,
+    default=sectors
+)
 
-@app.get("/company_list")
-async def get_company_list():
-    return COMPANY_INFO
+# Company multiselect
+company_options = {name: symbol for symbol, info in COMPANY_INFO.items() for name in [info['name']] if info['sector'] in selected_sectors}
+selected_companies = st.sidebar.multiselect(
+    "Select companies (maximum 10):",
+    options=list(company_options.keys()),
+    default=list(company_options.keys())[:6],
+    max_selections=10
+)
+
+months = st.sidebar.slider("Select the range of months", 6, 12, 6)
+
+if st.sidebar.button("Generate Comparison") and selected_companies:
+    with st.spinner('Fetching data...'):
+        selected_symbols = ','.join([company_options[name] for name in selected_companies])
+        response = requests.get(f"{API_ENDPOINT}/dividend_comparison/{months}?symbols={selected_symbols}")
+        
+        if response.status_code == 200:
+            data = response.json()
+            df = pd.DataFrame(data['data']).T
+            company_info = data['company_info']
+            
+            # Graph
+            fig = px.line(df, x=df.index, y=df.columns, 
+                          title=f"Cumulative Dividend Return (Last {months} months)",
+                          labels={"value": "Cumulative Return ($)", "variable": "Company"},
+                          line_shape="linear")
+            
+            # Update line colors based on sector
+            for trace in fig.data:
+                symbol = trace.name
+                sector = company_info[symbol]['sector']
+                trace.line.color = SECTOR_COLORS.get(sector, '#000000')
+            
+            # Update hover template to show full company name
+            for trace in fig.data:
+                symbol = trace.name
+                company_name = company_info[symbol]['name']
+                trace.hovertemplate = f"{company_name}<br>Date: %{{x}}<br>Value: %{{y:.2f}}<extra></extra>"
+            
+            st.plotly_chart(fig, use_container_width=True)
+            
+            # Total return table
+            st.subheader("📝 Total return at the end of the period:")
+            final_return = df.iloc[-1].sort_values(ascending=False)
+            final_return_df = pd.DataFrame({
+                "Symbol": final_return.index,
+                "Company Name": [company_info[symbol]['name'] for symbol in final_return.index],
+                "Sector": [company_info[symbol]['sector'] for symbol in final_return.index],
+                "Total Return ($)": final_return.values
+            })
+            st.table(final_return_df)
+            
+            # Fetch and display sector averages
+            response_avg = requests.get(f"{API_ENDPOINT}/sector_averages/{months}")
+            if response_avg.status_code == 200:
+                sector_data = response_avg.json()['data']
+                sector_df = pd.DataFrame(sector_data).T
+                
+                st.subheader("📊 Sector Averages")
+                fig_sector = px.line(sector_df, x=sector_df.index, y=sector_df.columns,
+                                     title=f"Average Cumulative Dividend Return by Sector (Last {months} months)",
+                                     labels={"value": "Average Cumulative Return ($)", "variable": "Sector"},
+                                     line_shape="linear")
+                
+                for trace in fig_sector.data:
+                    sector = trace.name
+                    trace.line.color = SECTOR_COLORS.get(sector, '#000000')
+                
+                st.plotly_chart(fig_sector, use_container_width=True)
+        else:
+            st.error(f"Error fetching data: {response.text}")
+else:
+    st.info("👈 Please select at least one company and click 'Generate Comparison' in the sidebar.")
+
+# Footer
+st.sidebar.markdown("---")
+st.sidebar.markdown("Developed by Adrián Lazzarini")
+st.sidebar.markdown("Data provided by Yahoo Finance")
